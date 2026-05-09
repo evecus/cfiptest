@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
-	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -302,95 +302,60 @@ func testSpeed(ip string, port int, durationSecs int) (float64, error) {
 	const testHost = "speed.cloudflare.com"
 	addr := net.JoinHostPort(ip, strconv.Itoa(port))
 
-	deadline := time.Now().Add(time.Duration(durationSecs) * time.Second)
-	var totalBytes int64
-	var lastErr error
-
-	// Keep opening connections and downloading until deadline
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-		if err != nil {
-			lastErr = fmt.Errorf("TCP连接失败: %v", err)
-			break
-		}
-
-		tlsCfg := &tls.Config{
-			InsecureSkipVerify: true,              // skip cert verify like Python tool
+	// Use net/http with forced dial to target IP, supports HTTP/2 automatically
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, addr)
+		},
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
 			ServerName:         testHost,
-			NextProtos:         []string{"http/1.1"}, // force HTTP/1.1, disable h2
-		}
-		tlsConn := tls.Client(conn, tlsCfg)
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			conn.Close()
+		},
+		ForceAttemptHTTP2:   true,
+		TLSHandshakeTimeout: 5 * time.Second,
+		DisableKeepAlives:   false,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   time.Duration(durationSecs+15) * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return fmt.Errorf("redirect not allowed")
+		},
+	}
+
+	req, _ := http.NewRequest("GET", "https://"+testHost+"/__down?bytes=104857600", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("请求失败: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("HTTP %d (协议: %s)", resp.StatusCode, resp.Proto)
+	}
+
+	logf("测速诊断 %s: 响应 %s %s", ip, resp.Proto, resp.Status)
+
+	buf := make([]byte, 32*1024)
+	var totalBytes int64
+	deadline := time.Now().Add(time.Duration(durationSecs) * time.Second)
+
+	for time.Now().Before(deadline) {
+		n, readErr := resp.Body.Read(buf)
+		totalBytes += int64(n)
+		if readErr != nil {
 			break
 		}
-		tlsConn.SetDeadline(time.Now().Add(remaining))
-
-		if err := tlsConn.Handshake(); err != nil {
-			tlsConn.Close()
-			lastErr = fmt.Errorf("TLS握手失败: %v", err)
-			break
-		}
-
-		reqStr := "GET /__down?bytes=104857600 HTTP/1.1\r\nHost: " + testHost + "\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
-		if _, err := tlsConn.Write([]byte(reqStr)); err != nil {
-			tlsConn.Close()
-			lastErr = fmt.Errorf("发送请求失败: %v", err)
-			break
-		}
-
-		buf := make([]byte, 32*1024)
-		var headerBuf []byte
-		headerDone := false
-		isFirstConn := totalBytes == 0 && lastErr == nil
-		var connBytes int64
-
-		for time.Now().Before(deadline) {
-			n, readErr := tlsConn.Read(buf)
-			if n > 0 {
-				if !headerDone {
-					headerBuf = append(headerBuf, buf[:n]...)
-					if idx := bytes.Index(headerBuf, []byte("\r\n\r\n")); idx >= 0 {
-						headerDone = true
-						bodyPart := int64(len(headerBuf) - idx - 4)
-						totalBytes += bodyPart
-						connBytes += bodyPart
-						// Log first response header for diagnosis
-						if isFirstConn {
-							firstLine := string(headerBuf[:bytes.IndexByte(headerBuf, '\r')])
-							logf("测速诊断 %s: 响应 [%s] header=%d字节 body起始=%d字节",
-								ip, firstLine, idx, bodyPart)
-							if !strings.HasPrefix(firstLine, "HTTP/1.1 200") {
-								tlsConn.Close()
-								return 0, fmt.Errorf("HTTP非200: %s", firstLine)
-							}
-						}
-						headerBuf = nil
-					}
-				} else {
-					totalBytes += int64(n)
-					connBytes += int64(n)
-				}
-			}
-			if readErr != nil {
-				break
-			}
-		}
-		if isFirstConn && !headerDone {
-			logf("测速诊断 %s: 未找到响应头分隔符，收到 %d 字节原始数据: %q",
-				ip, len(headerBuf), headerBuf[:min(len(headerBuf), 200)])
-		}
-		tlsConn.Close()
 	}
 
 	if totalBytes == 0 {
-		if lastErr != nil {
-			return 0, lastErr
-		}
-		return 0, fmt.Errorf("读取到 0 字节，请检查网络或IP可用性")
+		return 0, fmt.Errorf("读取到 0 字节")
 	}
-
 	mbps := float64(totalBytes) / 1024 / 1024 / float64(durationSecs)
 	return mbps, nil
 }
