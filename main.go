@@ -343,6 +343,8 @@ func testSpeed(ip string, port int, durationSecs int) (float64, error) {
 		buf := make([]byte, 32*1024)
 		var headerBuf []byte
 		headerDone := false
+		isFirstConn := totalBytes == 0 && lastErr == nil
+		var connBytes int64
 
 		for time.Now().Before(deadline) {
 			n, readErr := tlsConn.Read(buf)
@@ -351,17 +353,29 @@ func testSpeed(ip string, port int, durationSecs int) (float64, error) {
 					headerBuf = append(headerBuf, buf[:n]...)
 					if idx := bytes.Index(headerBuf, []byte("\r\n\r\n")); idx >= 0 {
 						headerDone = true
-						totalBytes += int64(len(headerBuf) - idx - 4)
+						bodyPart := int64(len(headerBuf) - idx - 4)
+						totalBytes += bodyPart
+						connBytes += bodyPart
+						// Log first response header for diagnosis
+						if isFirstConn {
+							firstLine := string(headerBuf[:bytes.IndexByte(headerBuf, '\r')])
+							logf("测速诊断 %s: 响应 [%s] header=%d字节 body起始=%d字节",
+								ip, firstLine, idx, bodyPart)
+						}
 						headerBuf = nil
 					}
 				} else {
 					totalBytes += int64(n)
+					connBytes += int64(n)
 				}
 			}
 			if readErr != nil {
-				// EOF means this request finished, try next connection
 				break
 			}
+		}
+		if isFirstConn && !headerDone {
+			logf("测速诊断 %s: 未找到响应头分隔符，收到 %d 字节原始数据: %q",
+				ip, len(headerBuf), headerBuf[:min(len(headerBuf), 200)])
 		}
 		tlsConn.Close()
 	}
