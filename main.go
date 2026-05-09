@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
@@ -154,7 +155,7 @@ func fetchIPs(url string) ([]string, error) {
 	return ips, sc.Err()
 }
 
-// expandCIDR returns up to 256 host IPs from a CIDR block.
+// expandCIDR returns up to 256 valid host IPs from a CIDR block using random sampling.
 func expandCIDR(cidr string) []string {
 	_, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
@@ -162,63 +163,57 @@ func expandCIDR(cidr string) []string {
 	}
 
 	ones, bits := ipNet.Mask.Size()
+	if bits != 32 {
+		return nil // IPv6 not supported
+	}
 	hostBits := bits - ones
-	const maxPerCIDR = 256
+	if hostBits == 0 {
+		return nil // single host, no valid range
+	}
+
+	// Convert network base to uint32 for easy arithmetic
+	base := ipNet.IP.To4()
+	if base == nil {
+		return nil
+	}
+	baseInt := uint32(base[0])<<24 | uint32(base[1])<<16 | uint32(base[2])<<8 | uint32(base[3])
+
+	totalHosts := uint32(1) << hostBits
+	// skip network address (+1) and broadcast (-1)
+	first := baseInt + 1
+	last := baseInt + totalHosts - 2
+	if first > last {
+		return nil
+	}
+
+	count := last - first + 1
+	const maxPerCIDR = 200
 
 	var ips []string
-	ip := cloneIP(ipNet.IP)
-
-	if hostBits <= 8 {
-		// Small block: enumerate all
-		for ipNet.Contains(ip) {
-			if !isNetOrBroadcast(ip, ipNet) {
-				ips = append(ips, ip.String())
-			}
-			incrementIP(ip)
+	if count <= maxPerCIDR {
+		// Small block: take all
+		for n := first; n <= last; n++ {
+			ips = append(ips, uint32ToIP(n))
 		}
 	} else {
-		// Large block: sample maxPerCIDR evenly
-		total := 1 << hostBits
-		step := total / maxPerCIDR
-		if step < 1 {
-			step = 1
-		}
-		for i := 0; i < maxPerCIDR; i++ {
-			candidate := cloneIP(ipNet.IP)
-			addToIP(candidate, i*step+step/2)
-			if !ipNet.Contains(candidate) {
-				break
+		// Large block: random sample without replacement
+		seen := make(map[uint32]bool, maxPerCIDR)
+		tries := 0
+		for len(ips) < maxPerCIDR && tries < maxPerCIDR*10 {
+			tries++
+			offset := rand.Uint32()%count + first
+			if seen[offset] {
+				continue
 			}
-			ips = append(ips, candidate.String())
+			seen[offset] = true
+			ips = append(ips, uint32ToIP(offset))
 		}
 	}
 	return ips
 }
 
-func cloneIP(ip net.IP) net.IP {
-	if ip4 := ip.To4(); ip4 != nil {
-		c := make(net.IP, 4)
-		copy(c, ip4)
-		return c
-	}
-	c := make(net.IP, len(ip))
-	copy(c, ip)
-	return c
-}
-
-func incrementIP(ip net.IP) {
-	for i := len(ip) - 1; i >= 0; i-- {
-		ip[i]++
-		if ip[i] != 0 {
-			break
-		}
-	}
-}
-
-func addToIP(ip net.IP, n int) {
-	for i := 0; i < n; i++ {
-		incrementIP(ip)
-	}
+func uint32ToIP(n uint32) string {
+	return fmt.Sprintf("%d.%d.%d.%d", n>>24, (n>>16)&0xff, (n>>8)&0xff, n&0xff)
 }
 
 func isNetOrBroadcast(ip net.IP, ipNet *net.IPNet) bool {
@@ -346,6 +341,7 @@ func runSpeedTests(candidates []latResult, port, durationSecs int) []speedResult
 	for _, c := range candidates {
 		mbps, err := testSpeed(c.IP, port, durationSecs)
 		if err != nil {
+			logf("测速失败 %s: %v", c.IP, err)
 			continue
 		}
 		results = append(results, speedResult{
