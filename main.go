@@ -300,61 +300,79 @@ type speedResult struct {
 
 func testSpeed(ip string, port int, durationSecs int) (float64, error) {
 	const testHost = "speed.cloudflare.com"
-
 	addr := net.JoinHostPort(ip, strconv.Itoa(port))
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err != nil {
-		return 0, fmt.Errorf("TCP连接失败: %v", err)
-	}
-	defer conn.Close()
 
-	tlsCfg := &tls.Config{
-		InsecureSkipVerify: false,
-		ServerName:         testHost,
-	}
-	tlsConn := tls.Client(conn, tlsCfg)
-	if err := tlsConn.SetDeadline(time.Now().Add(time.Duration(durationSecs+10) * time.Second)); err != nil {
-		return 0, err
-	}
-	if err := tlsConn.Handshake(); err != nil {
-		return 0, fmt.Errorf("TLS握手失败: %v", err)
-	}
-
-	reqStr := "GET /__down?bytes=104857600 HTTP/1.1\r\nHost: " + testHost + "\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
-	if _, err := tlsConn.Write([]byte(reqStr)); err != nil {
-		return 0, fmt.Errorf("发送请求失败: %v", err)
-	}
-
-	buf := make([]byte, 32*1024)
-	var headerBuf []byte
-	headerDone := false
-	var bodyBytes int64
 	deadline := time.Now().Add(time.Duration(durationSecs) * time.Second)
+	var totalBytes int64
+	var lastErr error
 
+	// Keep opening connections and downloading until deadline
 	for time.Now().Before(deadline) {
-		n, readErr := tlsConn.Read(buf)
-		if n > 0 {
-			if !headerDone {
-				headerBuf = append(headerBuf, buf[:n]...)
-				if idx := bytes.Index(headerBuf, []byte("\r\n\r\n")); idx >= 0 {
-					headerDone = true
-					bodyBytes += int64(len(headerBuf) - idx - 4)
-					headerBuf = nil
-				}
-			} else {
-				bodyBytes += int64(n)
-			}
-		}
-		if readErr != nil {
+		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err != nil {
+			lastErr = fmt.Errorf("TCP连接失败: %v", err)
 			break
 		}
+
+		tlsCfg := &tls.Config{
+			InsecureSkipVerify: false,
+			ServerName:         testHost,
+		}
+		tlsConn := tls.Client(conn, tlsCfg)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			conn.Close()
+			break
+		}
+		tlsConn.SetDeadline(time.Now().Add(remaining))
+
+		if err := tlsConn.Handshake(); err != nil {
+			tlsConn.Close()
+			lastErr = fmt.Errorf("TLS握手失败: %v", err)
+			break
+		}
+
+		reqStr := "GET /__down?bytes=104857600 HTTP/1.1\r\nHost: " + testHost + "\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+		if _, err := tlsConn.Write([]byte(reqStr)); err != nil {
+			tlsConn.Close()
+			lastErr = fmt.Errorf("发送请求失败: %v", err)
+			break
+		}
+
+		buf := make([]byte, 32*1024)
+		var headerBuf []byte
+		headerDone := false
+
+		for time.Now().Before(deadline) {
+			n, readErr := tlsConn.Read(buf)
+			if n > 0 {
+				if !headerDone {
+					headerBuf = append(headerBuf, buf[:n]...)
+					if idx := bytes.Index(headerBuf, []byte("\r\n\r\n")); idx >= 0 {
+						headerDone = true
+						totalBytes += int64(len(headerBuf) - idx - 4)
+						headerBuf = nil
+					}
+				} else {
+					totalBytes += int64(n)
+				}
+			}
+			if readErr != nil {
+				// EOF means this request finished, try next connection
+				break
+			}
+		}
+		tlsConn.Close()
 	}
 
-	if bodyBytes == 0 {
+	if totalBytes == 0 {
+		if lastErr != nil {
+			return 0, lastErr
+		}
 		return 0, fmt.Errorf("读取到 0 字节，请检查网络或IP可用性")
 	}
 
-	mbps := float64(bodyBytes) / 1024 / 1024 / float64(durationSecs)
+	mbps := float64(totalBytes) / 1024 / 1024 / float64(durationSecs)
 	return mbps, nil
 }
 func runSpeedTests(candidates []latResult, port, durationSecs int) []speedResult {
