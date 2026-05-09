@@ -106,23 +106,146 @@ func fetchIPs(url string) ([]string, error) {
 	}
 	defer resp.Body.Close()
 
-	var ips []string
+	var (
+		ips     []string
+		lines   int
+		skipped int
+		cidrs   int
+		plain   int
+	)
+
 	sc := bufio.NewScanner(resp.Body)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// strip port if present
-		host, _, err2 := net.SplitHostPort(line)
-		if err2 != nil {
-			host = line
+		lines++
+
+		// Strip port if present: "1.2.3.4:443"
+		host := line
+		if h, _, err2 := net.SplitHostPort(line); err2 == nil {
+			host = h
 		}
+
+		// Plain IP
 		if net.ParseIP(host) != nil {
 			ips = append(ips, host)
+			plain++
+			continue
+		}
+
+		// CIDR: expand and sample up to 256 IPs per block
+		if strings.Contains(host, "/") {
+			expanded := expandCIDR(host)
+			if len(expanded) > 0 {
+				ips = append(ips, expanded...)
+				cidrs++
+				continue
+			}
+		}
+
+		skipped++
+	}
+
+	logf("IP 列表解析: 原始行 %d 条，纯IP %d 个，CIDR块 %d 个，跳过 %d 条，合计候选 %d 个",
+		lines, plain, cidrs, skipped, len(ips))
+
+	return ips, sc.Err()
+}
+
+// expandCIDR returns up to 256 host IPs from a CIDR block.
+func expandCIDR(cidr string) []string {
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil
+	}
+
+	ones, bits := ipNet.Mask.Size()
+	hostBits := bits - ones
+	const maxPerCIDR = 256
+
+	var ips []string
+	ip := cloneIP(ipNet.IP)
+
+	if hostBits <= 8 {
+		// Small block: enumerate all
+		for ipNet.Contains(ip) {
+			if !isNetOrBroadcast(ip, ipNet) {
+				ips = append(ips, ip.String())
+			}
+			incrementIP(ip)
+		}
+	} else {
+		// Large block: sample maxPerCIDR evenly
+		total := 1 << hostBits
+		step := total / maxPerCIDR
+		if step < 1 {
+			step = 1
+		}
+		for i := 0; i < maxPerCIDR; i++ {
+			candidate := cloneIP(ipNet.IP)
+			addToIP(candidate, i*step+step/2)
+			if !ipNet.Contains(candidate) {
+				break
+			}
+			ips = append(ips, candidate.String())
 		}
 	}
-	return ips, sc.Err()
+	return ips
+}
+
+func cloneIP(ip net.IP) net.IP {
+	if ip4 := ip.To4(); ip4 != nil {
+		c := make(net.IP, 4)
+		copy(c, ip4)
+		return c
+	}
+	c := make(net.IP, len(ip))
+	copy(c, ip)
+	return c
+}
+
+func incrementIP(ip net.IP) {
+	for i := len(ip) - 1; i >= 0; i-- {
+		ip[i]++
+		if ip[i] != 0 {
+			break
+		}
+	}
+}
+
+func addToIP(ip net.IP, n int) {
+	for i := 0; i < n; i++ {
+		incrementIP(ip)
+	}
+}
+
+func isNetOrBroadcast(ip net.IP, ipNet *net.IPNet) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	net4 := ipNet.IP.To4()
+	mask := ipNet.Mask
+	// network address
+	isNet := true
+	for i := range ip4 {
+		if ip4[i] != net4[i] {
+			isNet = false
+			break
+		}
+	}
+	if isNet {
+		return true
+	}
+	// broadcast
+	for i := range ip4 {
+		if ip4[i] != (net4[i] | ^mask[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // ── Latency test ──────────────────────────────────────────────────────────────
