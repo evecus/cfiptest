@@ -302,29 +302,43 @@ func testSpeed(ip string, port int, durationSecs int) (float64, error) {
 	const testHost = "speed.cloudflare.com"
 	addr := net.JoinHostPort(ip, strconv.Itoa(port))
 
-	// Use net/http with forced dial to target IP, supports HTTP/2 automatically
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	// DialTLSContext: we do TLS ourselves and hand the conn to http.Transport.
+	// This preserves HTTP/2 ALPN negotiation while forcing the target IP.
 	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, network, addr)
+		DialTLSContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			rawConn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			tlsCfg := &tls.Config{
+				InsecureSkipVerify: true,
+				ServerName:         testHost,
+				// Let ALPN negotiate h2 or http/1.1 naturally
+			}
+			tlsConn := tls.Client(rawConn, tlsCfg)
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				rawConn.Close()
+				return nil, err
+			}
+			return tlsConn, nil
 		},
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-			ServerName:         testHost,
-		},
-		ForceAttemptHTTP2:   true,
-		TLSHandshakeTimeout: 5 * time.Second,
-		DisableKeepAlives:   false,
+		DisableKeepAlives: false,
 	}
+
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   time.Duration(durationSecs+15) * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return fmt.Errorf("redirect not allowed")
+			return fmt.Errorf("redirect")
 		},
 	}
 
-	req, _ := http.NewRequest("GET", "https://"+testHost+"/__down?bytes=104857600", nil)
+	req, _ := http.NewRequestWithContext(
+		context.Background(),
+		"GET",
+		"https://"+testHost+"/__down?bytes=104857600",
+		nil,
+	)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
@@ -339,7 +353,7 @@ func testSpeed(ip string, port int, durationSecs int) (float64, error) {
 		return 0, fmt.Errorf("HTTP %d (协议: %s)", resp.StatusCode, resp.Proto)
 	}
 
-	logf("测速诊断 %s: 响应 %s %s", ip, resp.Proto, resp.Status)
+	logf("测速诊断 %s: 协议=%s 状态=%s", ip, resp.Proto, resp.Status)
 
 	buf := make([]byte, 32*1024)
 	var totalBytes int64
