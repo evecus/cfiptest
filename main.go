@@ -315,7 +315,7 @@ func testSpeed(ip string, port int, durationSecs int) (float64, error) {
 		}
 
 		tlsCfg := &tls.Config{
-			InsecureSkipVerify: false,
+			InsecureSkipVerify: true,              // skip cert verify like Python tool
 			ServerName:         testHost,
 			NextProtos:         []string{"http/1.1"}, // force HTTP/1.1, disable h2
 		}
@@ -361,6 +361,10 @@ func testSpeed(ip string, port int, durationSecs int) (float64, error) {
 							firstLine := string(headerBuf[:bytes.IndexByte(headerBuf, '\r')])
 							logf("测速诊断 %s: 响应 [%s] header=%d字节 body起始=%d字节",
 								ip, firstLine, idx, bodyPart)
+							if !strings.HasPrefix(firstLine, "HTTP/1.1 200") {
+								tlsConn.Close()
+								return 0, fmt.Errorf("HTTP非200: %s", firstLine)
+							}
 						}
 						headerBuf = nil
 					}
