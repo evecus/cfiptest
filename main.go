@@ -317,6 +317,7 @@ func testSpeed(ip string, port int, durationSecs int) (float64, error) {
 		tlsCfg := &tls.Config{
 			InsecureSkipVerify: false,
 			ServerName:         testHost,
+			NextProtos:         []string{"http/1.1"}, // force HTTP/1.1, disable h2
 		}
 		tlsConn := tls.Client(conn, tlsCfg)
 		remaining := time.Until(deadline)
@@ -702,7 +703,7 @@ func scheduleCron(expr string, fn func()) error {
 		return err
 	}
 	go func() {
-		var lastFired int // track last minute we fired
+		lastFired := -1 // track last minute we fired, -1 = never fired
 		for {
 			now := time.Now()
 			if matches(now) {
