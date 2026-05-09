@@ -704,10 +704,7 @@ func main() {
 	logf("IP 列表: %s", cfg.IPListURL)
 	logf("并发数: %d  延迟Top: %d  测速秒数: %d", cfg.Concurrency, cfg.LatencyTop, cfg.SpeedSecs)
 
-	// Run immediately on start
-	go run(cfg)
-
-	// Then schedule via built-in cron
+	// Schedule via built-in cron (no immediate run on start)
 	if err := scheduleCron(cfg.CronExpr, func() { run(cfg) }); err != nil {
 		logf("ERROR cron 表达式解析失败: %v", err)
 		os.Exit(1)
