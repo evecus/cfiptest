@@ -3,7 +3,8 @@ use clap::{Parser, ValueEnum};
 use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use std::cmp::Ordering;
-use std::net::{IpAddr, SocketAddr};
+use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncBufReadExt;
@@ -56,6 +57,10 @@ struct Args {
     /// 测速时长上限（秒）
     #[arg(long, default_value_t = 4)]
     speed_test_seconds: u64,
+
+    /// CIDR 展开最大 IP 数（防止一次展开过大网段）
+    #[arg(long, default_value_t = 4096)]
+    max_cidr_expand: usize,
 
     /// 输出数量
     #[arg(short, long, default_value_t = 10)]
@@ -191,19 +196,103 @@ async fn read_ips(args: &Args) -> Result<Vec<IpAddr>> {
         text.lines().map(|s| s.trim().to_string()).collect()
     };
 
-    let mut out = Vec::new();
+    let mut out = BTreeSet::new();
     for s in segments {
         if s.is_empty() || s.starts_with('#') {
             continue;
         }
+
+        if s.contains('/') {
+            match expand_cidr(&s, args.max_cidr_expand) {
+                Ok(ips) => {
+                    for ip in ips {
+                        out.insert(ip);
+                    }
+                }
+                Err(e) => eprintln!("[忽略] CIDR 无效或过大: {s} ({e})"),
+            }
+            continue;
+        }
+
         match IpAddr::from_str(&s) {
-            Ok(ip) => out.push(ip),
+            Ok(ip) => {
+                out.insert(ip);
+            }
             Err(_) => eprintln!("[忽略] 非法 IP: {s}"),
         }
+    }
+    Ok(out.into_iter().collect())
+}
+
+fn expand_cidr(cidr: &str, max_expand: usize) -> Result<Vec<IpAddr>> {
+    let (ip_raw, prefix_raw) = cidr
+        .split_once('/')
+        .ok_or_else(|| anyhow!("CIDR 格式错误"))?;
+    let base_ip =
+        IpAddr::from_str(ip_raw.trim()).with_context(|| format!("CIDR IP 无效: {ip_raw}"))?;
+    let prefix: u8 = prefix_raw
+        .trim()
+        .parse()
+        .with_context(|| format!("CIDR 前缀无效: {prefix_raw}"))?;
+
+    match base_ip {
+        IpAddr::V4(v4) => expand_cidr_v4(v4, prefix, max_expand),
+        IpAddr::V6(v6) => expand_cidr_v6(v6, prefix, max_expand),
+    }
+}
+
+fn expand_cidr_v4(base: Ipv4Addr, prefix: u8, max_expand: usize) -> Result<Vec<IpAddr>> {
+    if prefix > 32 {
+        anyhow::bail!("IPv4 前缀必须在 0..=32");
+    }
+    let host_bits = 32 - prefix as u32;
+    let count: u128 = 1u128 << host_bits;
+    if count > max_expand as u128 {
+        anyhow::bail!("CIDR 包含 {count} 个 IP，超过 --max-cidr-expand={max_expand}");
+    }
+
+    let base_u32 = u32::from(base);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << host_bits
+    };
+    let network = base_u32 & mask;
+
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count as u32 {
+        out.push(IpAddr::V4(Ipv4Addr::from(network.wrapping_add(i))));
     }
     Ok(out)
 }
 
+fn expand_cidr_v6(base: Ipv6Addr, prefix: u8, max_expand: usize) -> Result<Vec<IpAddr>> {
+    if prefix > 128 {
+        anyhow::bail!("IPv6 前缀必须在 0..=128");
+    }
+    let host_bits = 128 - prefix as u32;
+    if host_bits >= 128 {
+        anyhow::bail!("CIDR 范围过大");
+    }
+    let count: u128 = 1u128 << host_bits;
+    if count > max_expand as u128 {
+        anyhow::bail!("CIDR 包含 {count} 个 IP，超过 --max-cidr-expand={max_expand}");
+    }
+
+    let base_u128 = u128::from(base);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u128::MAX << host_bits
+    };
+    let network = base_u128 & mask;
+
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        out.push(IpAddr::V6(Ipv6Addr::from(network.wrapping_add(i))));
+    }
+    Ok(out)
+}
 async fn read_stdin() -> Result<String> {
     let mut lines = Vec::new();
     let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
