@@ -1,38 +1,48 @@
-name: Build binaries
+name: Rust Backend CI
 
 on:
   push:
-    branches: ["**"]
+    paths:
+      - 'backend-rust/**'
+      - '.github/workflows/rust-backend.yml'
   pull_request:
+    paths:
+      - 'backend-rust/**'
+      - '.github/workflows/rust-backend.yml'
 
 jobs:
-  build:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend-rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo test --all --quiet
+
+  build-linux-binaries:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            artifact: cf-ip-optimizer-linux-amd64
-          - target: aarch64-unknown-linux-musl
-            artifact: cf-ip-optimizer-linux-arm64
-
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    defaults:
+      run:
+        working-directory: backend-rust
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Build
-        uses: houseabsolute/actions-rust-cross@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          command: build
-          target: ${{ matrix.target }}
-          args: "--release"
-
-      - name: Package
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package binary
         run: |
-          cp target/${{ matrix.target }}/release/cf-ip-optimizer ${{ matrix.artifact }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/pbox-speedtest-backend dist/pbox-speedtest-backend-${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: pbox-speedtest-backend-${{ matrix.target }}
+          path: backend-rust/dist/pbox-speedtest-backend-${{ matrix.target }}
